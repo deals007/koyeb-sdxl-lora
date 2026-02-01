@@ -18,7 +18,7 @@ RUN python3 -m pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch torchvision torchaudio
 
 # Clone kohya trainer
-RUN git clone --depth 1 https://github.com/bmaltais/kohya_ss.git /workspace/kohya_ss
+RUN git clone --depth 1 --recurse-submodules https://github.com/bmaltais/kohya_ss.git /workspace/kohya_ss
 
 WORKDIR /workspace/kohya_ss
 
