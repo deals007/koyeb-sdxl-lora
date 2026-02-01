@@ -2,7 +2,19 @@
 set -euo pipefail
 
 # -----------------------
-# Settings you can change
+# Koyeb health check (WEB service)
+# -----------------------
+PORT="${PORT:-8888}"
+python3 -m http.server "${PORT}" >/dev/null 2>&1 &
+
+# -----------------------
+# Hugging Face settings
+# -----------------------
+HF_DATASET_REPO="sheko007/bimbo-nails"
+HF_LORA_PATH="loras/bimbonails_sdxl_lora.safetensors"
+
+# -----------------------
+# Training settings
 # -----------------------
 MODEL_URL="https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors?download=true"
 MODEL_PATH="/workspace/models/sd_xl_base_1.0.safetensors"
@@ -14,104 +26,87 @@ TRAIN_DIR="/workspace/dataset/train/20_bimbonails"
 OUT_DIR="/workspace/output"
 OUT_NAME="bimbonails_sdxl_lora"
 
-# Training params (safe defaults)
 STEPS="${STEPS:-3000}"
 RANK="${RANK:-16}"
 ALPHA="${ALPHA:-16}"
+PRECISION="${PRECISION:-bf16}"
 
-mkdir -p /workspace/models /workspace/dataset /workspace/output
+mkdir -p /workspace/models /workspace/output /workspace/dataset
 
 # -----------------------
-# 1) Download SDXL base model (with basic size sanity check)
+# Download SDXL model
 # -----------------------
+AUTH_HEADER=()
+if [ -n "${HF_TOKEN:-}" ]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${HF_TOKEN}")
+fi
+
 if [ ! -f "$MODEL_PATH" ]; then
-  echo "Downloading SDXL base model..."
-  curl -fL --retry 10 --retry-delay 5 -o "${MODEL_PATH}.partial" "$MODEL_URL"
-  BYTES=$(stat -c%s "${MODEL_PATH}.partial" || echo 0)
-  echo "Downloaded bytes: $BYTES"
-  # SDXL base is ~6.5GB. If it's tiny, it likely downloaded HTML/blocked.
-  if [ "$BYTES" -lt 1000000000 ]; then
-    echo "ERROR: Model download too small. First 300 bytes:"
-    head -c 300 "${MODEL_PATH}.partial" || true
-    exit 1
-  fi
+  curl -fL --retry 10 "${AUTH_HEADER[@]}" \
+    -o "${MODEL_PATH}.partial" "$MODEL_URL"
   mv "${MODEL_PATH}.partial" "$MODEL_PATH"
-else
-  echo "Model exists: $MODEL_PATH"
 fi
 
 # -----------------------
-# 2) Unzip dataset
+# Prepare dataset
 # -----------------------
 rm -rf "$DATA_RAW"
 mkdir -p "$DATA_RAW"
 unzip -o "$DATA_ZIP" -d "$DATA_RAW"
 
-# Your zip extracts to: /workspace/dataset_raw/longnails-lora
-SRC_DIR="$(find "$DATA_RAW" -maxdepth 2 -type d -name "longnails-lora" | head -n 1)"
-if [ -z "$SRC_DIR" ]; then
-  echo "ERROR: Could not find extracted folder 'longnails-lora' inside zip."
-  echo "Folders found:"
-  find "$DATA_RAW" -maxdepth 2 -type d
-  exit 1
-fi
-
-# -----------------------
-# 3) Fix trigger token (recommended)
-#    Change 'bimbo nails' -> 'bimbonails'
-# -----------------------
-echo "Updating captions trigger: 'bimbo nails' -> 'bimbonails' ..."
-find "$SRC_DIR" -type f -name "*.txt" -print0 | while IFS= read -r -d '' f; do
-  sed -i 's/\bbimbo nails\b/bimbonails/g' "$f"
-done
-
-# -----------------------
-# 4) Move into kohya repeats folder structure
-# -----------------------
-rm -rf "$TRAIN_DIR"
+SRC_DIR="$(find "$DATA_RAW" -type d -name 'longnails-lora' | head -n 1)"
 mkdir -p "$TRAIN_DIR"
-# move images + txt
-shopt -s nullglob
 mv "$SRC_DIR"/* "$TRAIN_DIR"/
 
-# Basic sanity check: counts match
-PNG_COUNT=$(ls -1 "$TRAIN_DIR"/*.png 2>/dev/null | wc -l || true)
-TXT_COUNT=$(ls -1 "$TRAIN_DIR"/*.txt 2>/dev/null | wc -l || true)
-echo "Dataset: PNG=$PNG_COUNT TXT=$TXT_COUNT"
-if [ "$PNG_COUNT" -eq 0 ] || [ "$PNG_COUNT" -ne "$TXT_COUNT" ]; then
-  echo "ERROR: PNG/TXT mismatch or empty dataset."
+# Fix trigger
+find "$TRAIN_DIR" -name "*.txt" -exec sed -i 's/\bbimbo nails\b/bimbonails/g' {} \;
+
+# -----------------------
+# Find SDXL training script
+# -----------------------
+SCRIPT="/workspace/kohya_ss/sd-scripts/sdxl_train_network.py"
+if [ ! -f "$SCRIPT" ]; then
+  echo "ERROR: sdxl_train_network.py not found"
   exit 1
 fi
 
 # -----------------------
-# 5) Train SDXL LoRA (bucketing enabled for mixed 832x1216 + 1024x1024)
+# Train
 # -----------------------
-cd /workspace/kohya_ss
-
-# accelerate sometimes needs a default config; this usually works without interactive setup
-export HF_HOME=/workspace/.cache/huggingface
-export TRANSFORMERS_CACHE=/workspace/.cache/huggingface
-export TORCH_HOME=/workspace/.cache/torch
-
-echo "Starting training..."
-accelerate launch --num_cpu_threads_per_process=2 sdxl_train_network.py \
+accelerate launch --mixed_precision="$PRECISION" "$SCRIPT" \
   --pretrained_model_name_or_path="$MODEL_PATH" \
   --train_data_dir="/workspace/dataset/train" \
   --output_dir="$OUT_DIR" \
   --output_name="$OUT_NAME" \
   --network_module=networks.lora \
   --network_dim="$RANK" --network_alpha="$ALPHA" \
-  --resolution="1024" \
+  --resolution=1024 \
   --enable_bucket --bucket_reso_steps=64 --min_bucket_reso=512 --max_bucket_reso=1536 \
   --train_batch_size=1 --gradient_accumulation_steps=4 \
   --optimizer_type=AdamW8bit \
   --learning_rate=1e-4 --text_encoder_lr=5e-6 \
   --max_train_steps="$STEPS" \
-  --mixed_precision="fp16" --save_precision="fp16" \
+  --save_precision="$PRECISION" \
   --gradient_checkpointing \
   --save_every_n_steps=250 \
   --caption_extension=".txt" \
   --cache_latents
 
-echo "DONE. Output files:"
-ls -lh "$OUT_DIR"
+# -----------------------
+# Upload LoRA to Hugging Face dataset
+# -----------------------
+echo "Uploading LoRA to Hugging Face dataset..."
+
+python3 - <<EOF
+from huggingface_hub import upload_file
+upload_file(
+    path_or_fileobj="/workspace/output/bimbonails_sdxl_lora.safetensors",
+    path_in_repo="$HF_LORA_PATH",
+    repo_id="$HF_DATASET_REPO",
+    repo_type="dataset",
+    token="${HF_TOKEN}"
+)
+print("Upload complete.")
+EOF
+
+echo "ALL DONE ✅"
